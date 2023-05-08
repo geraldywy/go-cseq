@@ -1,6 +1,7 @@
 package cseq
 
 import (
+	"container/heap"
 	"errors"
 	"github.com/geraldywy/go-cseq/model"
 	"math"
@@ -38,7 +39,7 @@ func Init(data []*model.DataPoint) (CSEQ, error) {
 type CSEQ interface {
 	// Query accepts a list of object ids as a query, a desired resultSet size. The result size specified is not
 	// guaranteed, and the actual result set returned could be smaller if not enough matches are found.
-	Query(query []int, resultSet int, cutoffDist float64, cellSplitParam int) ([][]int, error)
+	Query(query []int, resultSet int, cutoffDist float64, cellSplitParam int) ([]*QueueNode, error)
 }
 
 var _ CSEQ = (*cseq)(nil)
@@ -48,7 +49,7 @@ type cseq struct {
 	index map[string]map[int]bool
 }
 
-func (c *cseq) Query(query []int, resultSet int, cutoffDist float64, cellSplitParam int) ([][]int, error) {
+func (c *cseq) Query(query []int, resultSet int, cutoffDist float64, cellSplitParam int) ([]*QueueNode, error) {
 	for _, id := range query {
 		if id < 0 || id >= len(c.data) { // we differ from the original library, using 0 indexed object ids
 			return nil, ErrIllegalIdInQuery
@@ -59,9 +60,9 @@ func (c *cseq) Query(query []int, resultSet int, cutoffDist float64, cellSplitPa
 }
 
 // we stick by param naming convention used in the original CSEQ repository
-func (c *cseq) getTopK(query []int, K int, r float64, D int) ([][]int, error) {
+func (c *cseq) getTopK(query []int, K int, r float64, D int) ([]*QueueNode, error) {
 	oriList := make([][]*pNode, 0)
-	oriListSpatial := make([][]*pNode, 0)
+	//oriListSpatial := make([][]*pNode, 0)
 
 	for _, id := range query {
 		pNodeList := c.filterType(c.data[id], r)
@@ -78,16 +79,80 @@ func (c *cseq) getTopK(query []int, K int, r float64, D int) ([][]int, error) {
 		sort.Slice(pNodeList, func(i, j int) bool {
 			return pNodeList[i].weight > pNodeList[j].weight
 		})
-		sort.Slice(pNodeListSpatial, func(i, j int) bool {
-			return pNodeListSpatial[i].distance < pNodeListSpatial[j].distance
-		})
+		//sort.Slice(pNodeListSpatial, func(i, j int) bool {
+		//	return pNodeListSpatial[i].distance < pNodeListSpatial[j].distance
+		//})
 		oriList = append(oriList, pNodeList)
-		oriListSpatial = append(oriListSpatial, pNodeListSpatial)
+		//oriListSpatial = append(oriListSpatial, pNodeListSpatial)
 	}
 
-	// TODO: compute totminmax lat lng
+	minLat := make([]float64, len(oriList))
+	minLng := make([]float64, len(oriList))
+	maxLat := make([]float64, len(oriList))
+	maxLng := make([]float64, len(oriList))
 
-	return nil, nil
+	totMinLat := 1e18
+	totMinLng := 1e18
+	totMaxLat := -1e18
+	totMaxLng := -1e18
+	for i, pNodeLis := range oriList {
+		minLat[i] = 1e18
+		minLng[i] = 1e18
+		maxLat[i] = -1e18
+		maxLng[i] = -1e18
+
+		for _, node := range pNodeLis {
+			minLat[i] = math.Min(minLat[i], c.data[node.id].Lat)
+			minLng[i] = math.Min(minLng[i], c.data[node.id].Lng)
+			maxLat[i] = math.Max(maxLat[i], c.data[node.id].Lat)
+			maxLng[i] = math.Max(maxLng[i], c.data[node.id].Lng)
+		}
+
+		totMinLat = math.Min(totMinLat, minLat[i])
+		totMinLng = math.Min(totMinLng, minLng[i])
+		totMaxLat = math.Max(totMaxLat, maxLat[i])
+		totMaxLng = math.Max(totMaxLng, maxLng[i])
+	}
+
+	spatialQueryVector := c.getSpatialVector(query)
+	var lengthLim float64
+	for _, wi := range spatialQueryVector {
+		lengthLim += wi * wi
+	}
+	lengthLim = math.Sqrt(lengthLim)
+
+	combination := make([]int, len(oriList))
+	que := make(priorityQueue, 0)
+	c.splitDFS(oriList, query, lengthLim, D, K, 0, &combination, &que, totMinLat, totMaxLat+1e-8, totMinLng, totMaxLng+1e-8)
+
+	res := make([]*QueueNode, 0)
+	for len(que) > 0 {
+		res = append(res, heap.Pop(&que).(*QueueNode))
+	}
+	for i := 0; i < len(res)/2; i++ {
+		res[i], res[len(res)-1-i] = res[len(res)-1-i], res[i]
+	}
+
+	return res, nil
+}
+
+func (c *cseq) splitDFS(oriList [][]*pNode, query []int, lengthLim float64, D, K int, odd int, combination *[]int,
+	que *priorityQueue, totMinLat, totMaxLat, totMinLng, totMaxLng float64) {
+
+}
+
+func (c *cseq) getSpatialVector(y []int) []float64 {
+	res := make([]float64, 0)
+	n := len(y)
+	for i := 0; i < n-1; i++ {
+		node1 := c.data[i]
+		for j := i + 1; j < n; j++ {
+			node2 := c.data[j]
+			res = append(res, sphericalDist(node1.Lat, node1.Lng, node2.Lat, node2.Lng))
+		}
+	}
+
+	return res
 }
 
 func (c *cseq) filterType(egNode *model.DataPoint, r float64) []*pNode {
