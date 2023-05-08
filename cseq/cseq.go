@@ -19,6 +19,29 @@ func Init(data []*model.DataPoint) (CSEQ, error) {
 		return nil, err
 	}
 
+	return &cseq{
+		data:       data,
+		index:      buildIndex(data),
+		rateP:      1.5,
+		errorBound: 1e-9,
+	}, nil
+}
+
+// InitExtras is a overloaded init, accepting extra params to better control cseq execution
+func InitExtras(data []*model.DataPoint, rateP, errorBound float64) (CSEQ, error) {
+	if err := verifyInitData(data); err != nil {
+		return nil, err
+	}
+
+	return &cseq{
+		data:       data,
+		index:      buildIndex(data),
+		rateP:      rateP,
+		errorBound: errorBound,
+	}, nil
+}
+
+func buildIndex(data []*model.DataPoint) map[string]map[int]bool {
 	index := make(map[string]map[int]bool)
 	for i, d := range data {
 		for _, cat := range d.Categories {
@@ -30,10 +53,7 @@ func Init(data []*model.DataPoint) (CSEQ, error) {
 		}
 	}
 
-	return &cseq{
-		data:  data,
-		index: index,
-	}, nil
+	return index
 }
 
 type CSEQ interface {
@@ -47,6 +67,9 @@ var _ CSEQ = (*cseq)(nil)
 type cseq struct {
 	data  []*model.DataPoint
 	index map[string]map[int]bool
+
+	rateP      float64
+	errorBound float64
 }
 
 func (c *cseq) Query(query []int, resultSet int, cutoffDist float64, cellSplitParam int) ([]*QueueNode, error) {
@@ -138,7 +161,132 @@ func (c *cseq) getTopK(query []int, K int, r float64, D int) ([]*QueueNode, erro
 
 func (c *cseq) splitDFS(oriList [][]*pNode, query []int, lengthLim float64, D, K int, odd int, combination *[]int,
 	que *priorityQueue, totMinLat, totMaxLat, totMinLng, totMaxLng float64) {
+	newMinLat := 1e18
+	newMinLng := 1e18
+	newMaxLat := -1e18
+	newMaxLng := -1e18
 
+	minLatList := make([]float64, len(oriList))
+	minLngList := make([]float64, len(oriList))
+	maxLatList := make([]float64, len(oriList))
+	maxLngList := make([]float64, len(oriList))
+	for i, pList := range oriList {
+		minLatList[i] = 1e18
+		minLngList[i] = 1e18
+		maxLatList[i] = -1e18
+		maxLngList[i] = -1e18
+
+		for _, p := range pList {
+			newMinLat = math.Min(newMinLat, c.data[p.id].Lat)
+			newMinLng = math.Min(newMinLng, c.data[p.id].Lng)
+			newMaxLat = math.Max(newMaxLat, c.data[p.id].Lat)
+			newMaxLng = math.Max(newMaxLng, c.data[p.id].Lng)
+			minLatList[i] = math.Min(minLatList[i], c.data[p.id].Lat)
+			minLngList[i] = math.Min(minLngList[i], c.data[p.id].Lng)
+			maxLatList[i] = math.Max(maxLatList[i], c.data[p.id].Lat)
+			maxLngList[i] = math.Max(maxLngList[i], c.data[p.id].Lng)
+		}
+	}
+
+	midLat := (totMinLat + totMaxLat) / 2.0
+	midLng := (totMinLng + totMaxLng) / 2.0
+	distRan1 := sphericalDist(midLat, midLng, midLat, totMaxLng)
+	distRan2 := sphericalDist(midLat, midLng, totMaxLat, midLng)
+
+	if (distRan1 <= lengthLim*c.rateP+c.errorBound) || (distRan2 <= lengthLim*c.rateP+c.errorBound) {
+		gridList := make([]map[int][]*pNode, len(query))
+
+		totDist := sphericalDist(newMinLat, newMinLng, newMaxLat, newMaxLng)
+		rr := math.Min(2.0, 2.0*math.Sqrt(3.0)*c.rateP*totDist/float64(D)/lengthLim+1.0)
+
+		regionMaxVal := make([]float64, 0)
+		for i, pList := range oriList {
+			gridList[i] = make(map[int][]*pNode)
+
+			var maxAttVal float64
+			for _, p := range pList {
+				gridId := c.getGridId(p.id, minLatList[i], minLngList[i], maxLatList[i], maxLngList[i], D)
+				if float64(len(gridList[i][gridId])) < float64(K)*rr {
+					gridList[i][gridId] = append(gridList[i][gridId], p)
+				}
+
+				maxAttVal = math.Max(maxAttVal, p.weight)
+			}
+
+			regionMaxVal = append(regionMaxVal, maxAttVal)
+		}
+
+		dfs(gridList, 0, query, combination, que, totMinLat, totMaxLat, totMinLng, totMaxLng, regionMaxVal)
+	} else {
+		leftListSet := make([][]*pNode, 0)
+		rightListSet := make([][]*pNode, 0)
+
+		leftFlag := true
+		rightFlag := true
+		for _, pList := range oriList {
+			leftList := make([]*pNode, 0)
+			rightList := make([]*pNode, 0)
+
+			for _, p := range pList {
+				if odd%2 == 0 {
+					dist1 := sphericalDist(midLat, c.data[p.id].Lng, c.data[p.id].Lat, c.data[p.id].Lng)
+
+					if (c.data[p.id].Lat < midLat) || (dist1 < lengthLim*c.rateP) {
+						leftList = append(leftList, p)
+					}
+
+					if (c.data[p.id].Lat >= midLat) || (dist1 < lengthLim*c.rateP) {
+						rightList = append(rightList, p)
+					}
+				} else {
+					dist1 := sphericalDist(c.data[p.id].Lat, midLng, c.data[p.id].Lat, c.data[p.id].Lng)
+
+					if (c.data[p.id].Lng < midLng) || (dist1 < lengthLim*c.rateP) {
+						leftList = append(leftList, p)
+					}
+
+					if (c.data[p.id].Lng >= midLng) || (dist1 < lengthLim*c.rateP) {
+						rightList = append(rightList, p)
+					}
+				}
+			}
+
+			if len(leftList) == 0 {
+				leftFlag = false
+			}
+			if len(rightList) == 0 {
+				rightFlag = false
+			}
+
+			leftListSet = append(leftListSet, leftList)
+			rightListSet = append(rightListSet, rightList)
+		}
+
+		if leftFlag {
+			if odd%2 == 0 {
+				c.splitDFS(leftListSet, query, lengthLim, D, K, odd^1, combination, que, totMinLat, midLat, totMinLng, totMaxLng)
+			} else {
+				c.splitDFS(leftListSet, query, lengthLim, D, K, odd^1, combination, que, totMinLat, totMaxLat, totMinLng, midLng)
+			}
+		}
+		if rightFlag {
+			if odd%2 == 0 {
+				c.splitDFS(rightListSet, query, lengthLim, D, K, odd^1, combination, que, midLat, totMaxLat, totMinLng, totMaxLng)
+			} else {
+				c.splitDFS(rightListSet, query, lengthLim, D, K, odd^1, combination, que, totMinLat, totMaxLat, midLng, totMaxLng)
+			}
+		}
+	}
+}
+
+func (c *cseq) getGridId(nodeId int, minLat, minLng, maxLat, maxLng float64, dCnt int) int {
+	latLength := (maxLat - minLat + 1e-9) / float64(dCnt)
+	lngLength := (maxLng - minLng + 1e-9) / float64(dCnt)
+
+	x := int((c.data[nodeId].Lat - minLat) / latLength)
+	y := int((c.data[nodeId].Lng - minLng) / lngLength)
+
+	return x*dCnt + y
 }
 
 func (c *cseq) getSpatialVector(y []int) []float64 {
