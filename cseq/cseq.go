@@ -3,6 +3,7 @@ package cseq
 import (
 	"container/heap"
 	"errors"
+	"fmt"
 	"github.com/geraldywy/go-cseq/model"
 	"math"
 	"sort"
@@ -24,11 +25,12 @@ func Init(data []*model.DataPoint) (CSEQ, error) {
 		index:      buildIndex(data),
 		rateP:      1.5,
 		errorBound: 1e-9,
+		alpha:      0.5,
 	}, nil
 }
 
 // InitExtras is a overloaded init, accepting extra params to better control cseq execution
-func InitExtras(data []*model.DataPoint, rateP, errorBound float64) (CSEQ, error) {
+func InitExtras(data []*model.DataPoint, rateP, errorBound, alpha float64) (CSEQ, error) {
 	if err := verifyInitData(data); err != nil {
 		return nil, err
 	}
@@ -38,6 +40,7 @@ func InitExtras(data []*model.DataPoint, rateP, errorBound float64) (CSEQ, error
 		index:      buildIndex(data),
 		rateP:      rateP,
 		errorBound: errorBound,
+		alpha:      alpha,
 	}, nil
 }
 
@@ -70,6 +73,7 @@ type cseq struct {
 
 	rateP      float64
 	errorBound float64
+	alpha      float64
 }
 
 func (c *cseq) Query(query []int, resultSet int, cutoffDist float64, cellSplitParam int) ([]*QueueNode, error) {
@@ -146,7 +150,7 @@ func (c *cseq) getTopK(query []int, K int, r float64, D int) ([]*QueueNode, erro
 
 	combination := make([]int, len(oriList))
 	que := make(priorityQueue, 0)
-	c.splitDFS(oriList, query, lengthLim, D, K, 0, &combination, &que, totMinLat, totMaxLat+1e-8, totMinLng, totMaxLng+1e-8)
+	c.splitDFS(oriList, query, lengthLim, D, K, 0, &combination, &que, totMinLat, totMaxLat+1e-8, totMinLng, totMaxLng+1e-8, spatialQueryVector)
 
 	res := make([]*QueueNode, 0)
 	for len(que) > 0 {
@@ -160,7 +164,7 @@ func (c *cseq) getTopK(query []int, K int, r float64, D int) ([]*QueueNode, erro
 }
 
 func (c *cseq) splitDFS(oriList [][]*pNode, query []int, lengthLim float64, D, K int, odd int, combination *[]int,
-	que *priorityQueue, totMinLat, totMaxLat, totMinLng, totMaxLng float64) {
+	que *priorityQueue, totMinLat, totMaxLat, totMinLng, totMaxLng float64, spatialQueryVector []float64) {
 	newMinLat := 1e18
 	newMinLng := 1e18
 	newMaxLat := -1e18
@@ -216,7 +220,7 @@ func (c *cseq) splitDFS(oriList [][]*pNode, query []int, lengthLim float64, D, K
 			regionMaxVal = append(regionMaxVal, maxAttVal)
 		}
 
-		dfs(gridList, 0, query, combination, que, totMinLat, totMaxLat, totMinLng, totMaxLng, regionMaxVal)
+		c.dfs(gridList, 0, query, combination, que, totMinLat, totMaxLat, totMinLng, totMaxLng, regionMaxVal, K, spatialQueryVector)
 	} else {
 		leftListSet := make([][]*pNode, 0)
 		rightListSet := make([][]*pNode, 0)
@@ -264,19 +268,165 @@ func (c *cseq) splitDFS(oriList [][]*pNode, query []int, lengthLim float64, D, K
 
 		if leftFlag {
 			if odd%2 == 0 {
-				c.splitDFS(leftListSet, query, lengthLim, D, K, odd^1, combination, que, totMinLat, midLat, totMinLng, totMaxLng)
+				c.splitDFS(leftListSet, query, lengthLim, D, K, odd^1, combination, que, totMinLat, midLat, totMinLng, totMaxLng, spatialQueryVector)
 			} else {
-				c.splitDFS(leftListSet, query, lengthLim, D, K, odd^1, combination, que, totMinLat, totMaxLat, totMinLng, midLng)
+				c.splitDFS(leftListSet, query, lengthLim, D, K, odd^1, combination, que, totMinLat, totMaxLat, totMinLng, midLng, spatialQueryVector)
 			}
 		}
 		if rightFlag {
 			if odd%2 == 0 {
-				c.splitDFS(rightListSet, query, lengthLim, D, K, odd^1, combination, que, midLat, totMaxLat, totMinLng, totMaxLng)
+				c.splitDFS(rightListSet, query, lengthLim, D, K, odd^1, combination, que, midLat, totMaxLat, totMinLng, totMaxLng, spatialQueryVector)
 			} else {
-				c.splitDFS(rightListSet, query, lengthLim, D, K, odd^1, combination, que, totMinLat, totMaxLat, midLng, totMaxLng)
+				c.splitDFS(rightListSet, query, lengthLim, D, K, odd^1, combination, que, totMinLat, totMaxLat, midLng, totMaxLng, spatialQueryVector)
 			}
 		}
 	}
+}
+
+func (c *cseq) dfs(gridList []map[int][]*pNode, num int, query []int, combination *[]int, que *priorityQueue,
+	totMinLat, totMaxLat, totMinLng, totMaxLng float64, regionMaxVal []float64, K int, spatialQueryVector []float64) {
+	if num == len(query) {
+		pq := make(itemPriorityQueue, 0)
+		var sum float64
+		ps := make(map[string]bool) // hash of []int as key
+		sumVec := make([]int, 0)
+
+		for i := 0; i < num; i++ {
+			sum += gridList[i][(*combination)[i]][0].weight
+			sumVec = append(sumVec, 0)
+		}
+
+		heap.Push(&pq, &item{
+			value:    sumVec,
+			priority: sum,
+		})
+
+		for i := 0; i < K; i++ {
+			if len(pq) == 0 {
+				break
+			}
+
+			wc := heap.Pop(&pq).(*item)
+			candiVector := make([]int, 0)
+			inFlag := false
+
+			for j := 0; j < num; j++ {
+				candId := gridList[i][(*combination)[j]][wc.value[j]].id
+				candiVector = append(candiVector, candId)
+				if j == 0 {
+					lat1 := c.data[candId].Lat
+					lng1 := c.data[candId].Lng
+
+					if lat1 >= totMinLat && lat1 < totMaxLat && lng1 >= totMinLng && lng1 < totMaxLng {
+						inFlag = true
+					}
+				}
+			}
+
+			similarity := c.sim(query, candiVector, wc.priority, spatialQueryVector)
+			rate := c.distanceRate(query, candiVector)
+
+			if len(*que) >= K && ((1-c.alpha)*wc.priority/float64(len(query))+c.alpha*1.0) < (*que)[0].Weight+c.errorBound {
+				return
+			}
+			if rate > c.rateP || rate < 1.0/c.rateP || !inFlag {
+				if rate > (1+c.rateP)*c.rateP {
+					return
+				}
+
+				i--
+			} else {
+				if len(*que) < K {
+					*que = append(*que, &QueueNode{
+						Ids:     candiVector,
+						Weight:  similarity,
+						AvgDist: c.getAvgDist(candiVector),
+					})
+				} else if similarity > (*que)[0].Weight {
+					heap.Pop(que)
+					heap.Push(que, &QueueNode{
+						Ids:     candiVector,
+						Weight:  similarity,
+						AvgDist: c.getAvgDist(candiVector),
+					})
+				}
+			}
+
+			num1 := 0
+			if !inFlag {
+				num1 = 1
+			} else {
+				num1 = num
+			}
+
+			for j := 0; j < num1; j++ {
+				if wc.value[j]+1 < len(gridList[j][(*combination)[j]]) {
+					sumTmp := wc.priority - gridList[j][(*combination)[j]][wc.value[j]].weight + gridList[j][(*combination)[j]][wc.value[j]+1].weight
+					wc.value[j]++
+					if _, exist := ps[fmt.Sprint(wc.value)]; !exist {
+						ps[fmt.Sprint(wc.value)] = true
+						heap.Push(&pq, &item{
+							value:    wc.value,
+							priority: sumTmp,
+						})
+					}
+					wc.value[j]--
+				}
+			}
+		}
+
+		return
+	}
+
+	for key := range gridList[num] {
+		(*combination)[num] = key
+
+		if len(*que) >= K {
+			var UB, cw float64
+			for j := 0; j <= num; j++ {
+				cw += gridList[j][(*combination)[j]][0].weight
+			}
+			for j := num + 1; j < len(query); j++ {
+				cw += regionMaxVal[j]
+			}
+			UB = (1-c.alpha)*cw/float64(len(query)) + c.alpha*1.0
+			if UB < math.Min(c.errorBound+(*que)[0].Weight, 1.0) {
+				continue
+			}
+		}
+
+		c.dfs(gridList, num+1, query, combination, que, totMinLat, totMaxLat, totMinLng, totMaxLng, regionMaxVal, K, spatialQueryVector)
+	}
+}
+
+func (c *cseq) distanceRate(query []int, combination []int) float64 {
+	v1 := c.getSpatialVector(query)
+	v2 := c.getSpatialVector(combination)
+
+	var X, Y float64
+	for j := 0; j < len(v1); j++ {
+		X += v1[j] * v1[j]
+		Y += v2[j] * v2[j]
+	}
+
+	X = math.Sqrt(X)
+	Y = math.Sqrt(Y)
+
+	return X / Y
+}
+
+func (c *cseq) getAvgDist(combination []int) float64 {
+	var ans float64
+	n := len(combination)
+	for i := 0; i < n-1; i++ {
+		node1 := c.data[i]
+		for j := i + 1; j < n; j++ {
+			node2 := c.data[j]
+			ans += sphericalDist(node1.Lat, node1.Lng, node2.Lat, node2.Lng)
+		}
+	}
+
+	return 2 * ans / float64(n*(n-1))
 }
 
 func (c *cseq) getGridId(nodeId int, minLat, minLng, maxLat, maxLng float64, dCnt int) int {
@@ -324,6 +474,32 @@ func (c *cseq) filterType(egNode *model.DataPoint, r float64) []*pNode {
 	}
 
 	return res
+}
+
+func (c *cseq) sim(query []int, combination []int, currentWeight float64, spatialQueryVector []float64) float64 {
+	ans := c.alpha * c.getSpatialSim(combination, spatialQueryVector)
+
+	return (1-c.alpha)*currentWeight/float64(len(query)) + ans
+}
+
+func (c *cseq) getSpatialSim(combination []int, spatialQueryVector []float64) float64 {
+	v2 := c.getSpatialVector(combination)
+	var ans float64
+
+	for i := 0; i < len(spatialQueryVector); i++ {
+		ans += spatialQueryVector[i] * v2[i]
+	}
+
+	var X, Y float64
+	for i := 0; i < len(spatialQueryVector); i++ {
+		X += spatialQueryVector[i] * spatialQueryVector[i]
+		Y += v2[i] * v2[i]
+	}
+
+	ans /= math.Sqrt(Y)
+	ans = math.Sqrt(X)
+
+	return ans
 }
 
 func sim(candNode, egNode *model.DataPoint) float64 {
