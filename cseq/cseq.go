@@ -44,15 +44,19 @@ func InitExtras(data []*model.DataPoint, rateP, errorBound, alpha float64) (CSEQ
 	}, nil
 }
 
-func buildIndex(data []*model.DataPoint) map[string]map[int]bool {
-	index := make(map[string]map[int]bool)
+func buildIndex(data []*model.DataPoint) map[string][]int {
+	added := make(map[string]map[int]bool)
+	index := make(map[string][]int)
 	for i, d := range data {
 		for _, cat := range d.Categories {
-			if _, exist := index[cat]; !exist {
-				index[cat] = make(map[int]bool)
+			if _, exist := added[cat]; !exist {
+				added[cat] = make(map[int]bool)
+			}
+			if _, exist := added[cat][i]; exist {
+				continue
 			}
 
-			index[cat][i] = true
+			index[cat] = append(index[cat], i)
 		}
 	}
 
@@ -62,57 +66,57 @@ func buildIndex(data []*model.DataPoint) map[string]map[int]bool {
 type CSEQ interface {
 	// Query accepts a list of object ids as a query, a desired resultSet size. The result size specified is not
 	// guaranteed, and the actual result set returned could be smaller if not enough matches are found.
-	Query(query []int, resultSet int, cutoffDist float64, cellSplitParam int) ([]*QueueNode, error)
+	Query(query []int, resultSetSize int) ([]*QueueNode, error)
+	QueryExplicit(query []int, resultSetSize int, cutoffDist float64, cellSplitParam int) ([]*QueueNode, error)
 }
 
 var _ CSEQ = (*cseq)(nil)
 
 type cseq struct {
 	data  []*model.DataPoint
-	index map[string]map[int]bool
+	index map[string][]int
 
 	rateP      float64
 	errorBound float64
 	alpha      float64
 }
 
-func (c *cseq) Query(query []int, resultSet int, cutoffDist float64, cellSplitParam int) ([]*QueueNode, error) {
+func (c *cseq) Query(query []int, resultSetSize int) ([]*QueueNode, error) {
 	for _, id := range query {
 		if id < 0 || id >= len(c.data) { // we differ from the original library, using 0 indexed object ids
 			return nil, ErrIllegalIdInQuery
 		}
 	}
 
-	return c.getTopK(query, resultSet, cutoffDist, cellSplitParam)
+	return c.getTopK(query, resultSetSize, 10000000, 5)
+}
+
+func (c *cseq) QueryExplicit(query []int, resultSetSize int, cutoffDist float64, cellSplitParam int) ([]*QueueNode, error) {
+	for _, id := range query {
+		if id < 0 || id >= len(c.data) { // we differ from the original library, using 0 indexed object ids
+			return nil, ErrIllegalIdInQuery
+		}
+	}
+
+	return c.getTopK(query, resultSetSize, cutoffDist, cellSplitParam)
 }
 
 // we stick by param naming convention used in the original CSEQ repository
 func (c *cseq) getTopK(query []int, K int, r float64, D int) ([]*QueueNode, error) {
 	oriList := make([][]*pNode, 0)
-	//oriListSpatial := make([][]*pNode, 0)
-
 	for _, id := range query {
 		pNodeList := c.filterType(c.data[id], r)
-
-		pNodeListSpatial := make([]*pNode, len(pNodeList))
-		for i, p := range pNodeList {
-			pNodeListSpatial[i] = &pNode{
-				id:       p.id,
-				weight:   p.weight,
-				distance: p.distance,
-			}
-		}
-
 		sort.Slice(pNodeList, func(i, j int) bool {
+			if pNodeList[i].weight == pNodeList[j].weight {
+				if pNodeList[i].distance == pNodeList[j].distance {
+					return pNodeList[i].id < pNodeList[j].id
+				}
+				return pNodeList[i].distance < pNodeList[j].distance
+			}
 			return pNodeList[i].weight > pNodeList[j].weight
 		})
-		//sort.Slice(pNodeListSpatial, func(i, j int) bool {
-		//	return pNodeListSpatial[i].distance < pNodeListSpatial[j].distance
-		//})
 		oriList = append(oriList, pNodeList)
-		//oriListSpatial = append(oriListSpatial, pNodeListSpatial)
 	}
-
 	minLat := make([]float64, len(oriList))
 	minLng := make([]float64, len(oriList))
 	maxLat := make([]float64, len(oriList))
@@ -174,6 +178,7 @@ func (c *cseq) splitDFS(oriList [][]*pNode, query []int, lengthLim float64, D, K
 	minLngList := make([]float64, len(oriList))
 	maxLatList := make([]float64, len(oriList))
 	maxLngList := make([]float64, len(oriList))
+
 	for i, pList := range oriList {
 		minLatList[i] = 1e18
 		minLngList[i] = 1e18
@@ -202,21 +207,17 @@ func (c *cseq) splitDFS(oriList [][]*pNode, query []int, lengthLim float64, D, K
 
 		totDist := sphericalDist(newMinLat, newMinLng, newMaxLat, newMaxLng)
 		rr := math.Min(2.0, 2.0*math.Sqrt(3.0)*c.rateP*totDist/float64(D)/lengthLim+1.0)
-
 		regionMaxVal := make([]float64, 0)
 		for i, pList := range oriList {
 			gridList[i] = make(map[int][]*pNode)
-
 			var maxAttVal float64
 			for _, p := range pList {
 				gridId := c.getGridId(p.id, minLatList[i], minLngList[i], maxLatList[i], maxLngList[i], D)
 				if float64(len(gridList[i][gridId])) < float64(K)*rr {
 					gridList[i][gridId] = append(gridList[i][gridId], p)
 				}
-
 				maxAttVal = math.Max(maxAttVal, p.weight)
 			}
-
 			regionMaxVal = append(regionMaxVal, maxAttVal)
 		}
 
@@ -297,8 +298,8 @@ func (c *cseq) dfs(gridList []map[int][]*pNode, num int, query []int, combinatio
 		}
 
 		heap.Push(&pq, &item{
-			value:    sumVec,
 			priority: sum,
+			value:    sumVec,
 		})
 
 		for i := 0; i < K; i++ {
@@ -311,7 +312,7 @@ func (c *cseq) dfs(gridList []map[int][]*pNode, num int, query []int, combinatio
 			inFlag := false
 
 			for j := 0; j < num; j++ {
-				candId := gridList[i][(*combination)[j]][wc.value[j]].id
+				candId := gridList[j][(*combination)[j]][wc.value[j]].id
 				candiVector = append(candiVector, candId)
 				if j == 0 {
 					lat1 := c.data[candId].Lat
@@ -365,8 +366,10 @@ func (c *cseq) dfs(gridList []map[int][]*pNode, num int, query []int, combinatio
 					wc.value[j]++
 					if _, exist := ps[fmt.Sprint(wc.value)]; !exist {
 						ps[fmt.Sprint(wc.value)] = true
+						valCopy := make([]int, len(wc.value))
+						copy(valCopy, wc.value)
 						heap.Push(&pq, &item{
-							value:    wc.value,
+							value:    valCopy,
 							priority: sumTmp,
 						})
 					}
@@ -380,7 +383,6 @@ func (c *cseq) dfs(gridList []map[int][]*pNode, num int, query []int, combinatio
 
 	for key := range gridList[num] {
 		(*combination)[num] = key
-
 		if len(*que) >= K {
 			var UB, cw float64
 			for j := 0; j <= num; j++ {
@@ -419,9 +421,9 @@ func (c *cseq) getAvgDist(combination []int) float64 {
 	var ans float64
 	n := len(combination)
 	for i := 0; i < n-1; i++ {
-		node1 := c.data[i]
+		node1 := c.data[combination[i]]
 		for j := i + 1; j < n; j++ {
-			node2 := c.data[j]
+			node2 := c.data[combination[j]]
 			ans += sphericalDist(node1.Lat, node1.Lng, node2.Lat, node2.Lng)
 		}
 	}
@@ -443,9 +445,9 @@ func (c *cseq) getSpatialVector(y []int) []float64 {
 	res := make([]float64, 0)
 	n := len(y)
 	for i := 0; i < n-1; i++ {
-		node1 := c.data[i]
+		node1 := c.data[y[i]]
 		for j := i + 1; j < n; j++ {
-			node2 := c.data[j]
+			node2 := c.data[y[j]]
 			res = append(res, sphericalDist(node1.Lat, node1.Lng, node2.Lat, node2.Lng))
 		}
 	}
@@ -458,7 +460,7 @@ func (c *cseq) filterType(egNode *model.DataPoint, r float64) []*pNode {
 	used := make([]bool, len(c.data))
 
 	for _, cat := range egNode.Categories {
-		for candNodeId := range c.index[cat] {
+		for _, candNodeId := range c.index[cat] {
 			candNode := c.data[candNodeId]
 			if used[candNodeId] || !checkDist(r, egNode, candNode) {
 				continue
