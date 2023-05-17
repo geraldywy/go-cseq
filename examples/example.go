@@ -11,12 +11,6 @@ import (
 	"strings"
 )
 
-type Person struct {
-	Name   string
-	Age    int
-	Height float64
-}
-
 func main() {
 	// Open the CSV file for reading
 	file, err := os.Open("gaode_poi_2018_value_1000000.csv")
