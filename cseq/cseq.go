@@ -74,6 +74,7 @@ var _ CSEQ = (*cseq)(nil)
 
 type cseq struct {
 	data  []*model.DataPoint
+	query []int
 	index map[string][]int
 
 	rateP      float64
@@ -87,6 +88,7 @@ func (c *cseq) Query(query []int, resultSetSize int) ([]*QueueNode, error) {
 			return nil, ErrIllegalIdInQuery
 		}
 	}
+	c.query = query
 
 	return c.getTopK(query, resultSetSize, 10000000, 5)
 }
@@ -97,6 +99,7 @@ func (c *cseq) QueryExplicit(query []int, resultSetSize int, cutoffDist float64,
 			return nil, ErrIllegalIdInQuery
 		}
 	}
+	c.query = query
 
 	return c.getTopK(query, resultSetSize, cutoffDist, cellSplitParam)
 }
@@ -322,6 +325,19 @@ func (c *cseq) dfs(gridList []map[int][]*pNode, num int, query []int, combinatio
 						inFlag = true
 					}
 				}
+			}
+
+			// if candidate signature dont match, skip
+			allMatch := true
+			for idx, cand := range candiVector {
+				// strict match, primary category must match
+				if c.data[c.query[idx]].Categories[0] != c.data[cand].Categories[0] {
+					allMatch = false
+					break
+				}
+			}
+			if !allMatch {
+				return
 			}
 
 			similarity := c.sim(query, candiVector, wc.priority, spatialQueryVector)
