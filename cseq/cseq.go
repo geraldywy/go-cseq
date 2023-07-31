@@ -66,8 +66,8 @@ func buildIndex(data []*model.DataPoint) map[string][]int {
 type CSEQ interface {
 	// Query accepts a list of object ids as a query, a desired resultSet size. The result size specified is not
 	// guaranteed, and the actual result set returned could be smaller if not enough matches are found.
-	Query(query []int, resultSetSize int) ([]*QueueNode, error)
-	QueryExplicit(query []int, resultSetSize int, cutoffDist float64, cellSplitParam int) ([]*QueueNode, error)
+	Query(query []int, resultSetSize int, noOverlap bool) ([]*QueueNode, error)
+	QueryExplicit(query []int, resultSetSize int, cutoffDist float64, cellSplitParam int, noOverlap bool) ([]*QueueNode, error)
 }
 
 var _ CSEQ = (*cseq)(nil)
@@ -82,7 +82,7 @@ type cseq struct {
 	alpha      float64
 }
 
-func (c *cseq) Query(query []int, resultSetSize int) ([]*QueueNode, error) {
+func (c *cseq) Query(query []int, resultSetSize int, noOverlap bool) ([]*QueueNode, error) {
 	for _, id := range query {
 		if id < 0 || id >= len(c.data) { // we differ from the original library, using 0 indexed object ids
 			return nil, ErrIllegalIdInQuery
@@ -90,10 +90,10 @@ func (c *cseq) Query(query []int, resultSetSize int) ([]*QueueNode, error) {
 	}
 	c.query = query
 
-	return c.getTopK(query, resultSetSize, 10000000, 5)
+	return c.getTopK(query, resultSetSize, 10000000, 5, noOverlap)
 }
 
-func (c *cseq) QueryExplicit(query []int, resultSetSize int, cutoffDist float64, cellSplitParam int) ([]*QueueNode, error) {
+func (c *cseq) QueryExplicit(query []int, resultSetSize int, cutoffDist float64, cellSplitParam int, noOverlap bool) ([]*QueueNode, error) {
 	for _, id := range query {
 		if id < 0 || id >= len(c.data) { // we differ from the original library, using 0 indexed object ids
 			return nil, ErrIllegalIdInQuery
@@ -101,11 +101,11 @@ func (c *cseq) QueryExplicit(query []int, resultSetSize int, cutoffDist float64,
 	}
 	c.query = query
 
-	return c.getTopK(query, resultSetSize, cutoffDist, cellSplitParam)
+	return c.getTopK(query, resultSetSize, cutoffDist, cellSplitParam, noOverlap)
 }
 
 // we stick by param naming convention used in the original CSEQ repository
-func (c *cseq) getTopK(query []int, K int, r float64, D int) ([]*QueueNode, error) {
+func (c *cseq) getTopK(query []int, K int, r float64, D int, noOverlap bool) ([]*QueueNode, error) {
 	oriList := make([][]*pNode, 0)
 	for _, id := range query {
 		pNodeList := c.filterType(c.data[id], r)
@@ -157,7 +157,7 @@ func (c *cseq) getTopK(query []int, K int, r float64, D int) ([]*QueueNode, erro
 
 	combination := make([]int, len(oriList))
 	que := make(priorityQueue, 0)
-	c.splitDFS(oriList, query, lengthLim, D, K, 0, &combination, &que, totMinLat, totMaxLat+1e-8, totMinLng, totMaxLng+1e-8, spatialQueryVector)
+	c.splitDFS(oriList, query, lengthLim, D, K, 0, &combination, &que, totMinLat, totMaxLat+1e-8, totMinLng, totMaxLng+1e-8, spatialQueryVector, noOverlap)
 
 	res := make([]*QueueNode, 0)
 	for len(que) > 0 {
@@ -171,7 +171,7 @@ func (c *cseq) getTopK(query []int, K int, r float64, D int) ([]*QueueNode, erro
 }
 
 func (c *cseq) splitDFS(oriList [][]*pNode, query []int, lengthLim float64, D, K int, odd int, combination *[]int,
-	que *priorityQueue, totMinLat, totMaxLat, totMinLng, totMaxLng float64, spatialQueryVector []float64) {
+	que *priorityQueue, totMinLat, totMaxLat, totMinLng, totMaxLng float64, spatialQueryVector []float64, noOverlap bool) {
 	newMinLat := 1e18
 	newMinLng := 1e18
 	newMaxLat := -1e18
@@ -224,7 +224,7 @@ func (c *cseq) splitDFS(oriList [][]*pNode, query []int, lengthLim float64, D, K
 			regionMaxVal = append(regionMaxVal, maxAttVal)
 		}
 
-		c.dfs(gridList, 0, query, combination, que, totMinLat, totMaxLat, totMinLng, totMaxLng, regionMaxVal, K, spatialQueryVector)
+		c.dfs(gridList, 0, query, combination, que, totMinLat, totMaxLat, totMinLng, totMaxLng, regionMaxVal, K, spatialQueryVector, noOverlap)
 	} else {
 		leftListSet := make([][]*pNode, 0)
 		rightListSet := make([][]*pNode, 0)
@@ -272,23 +272,23 @@ func (c *cseq) splitDFS(oriList [][]*pNode, query []int, lengthLim float64, D, K
 
 		if leftFlag {
 			if odd%2 == 0 {
-				c.splitDFS(leftListSet, query, lengthLim, D, K, odd^1, combination, que, totMinLat, midLat, totMinLng, totMaxLng, spatialQueryVector)
+				c.splitDFS(leftListSet, query, lengthLim, D, K, odd^1, combination, que, totMinLat, midLat, totMinLng, totMaxLng, spatialQueryVector, noOverlap)
 			} else {
-				c.splitDFS(leftListSet, query, lengthLim, D, K, odd^1, combination, que, totMinLat, totMaxLat, totMinLng, midLng, spatialQueryVector)
+				c.splitDFS(leftListSet, query, lengthLim, D, K, odd^1, combination, que, totMinLat, totMaxLat, totMinLng, midLng, spatialQueryVector, noOverlap)
 			}
 		}
 		if rightFlag {
 			if odd%2 == 0 {
-				c.splitDFS(rightListSet, query, lengthLim, D, K, odd^1, combination, que, midLat, totMaxLat, totMinLng, totMaxLng, spatialQueryVector)
+				c.splitDFS(rightListSet, query, lengthLim, D, K, odd^1, combination, que, midLat, totMaxLat, totMinLng, totMaxLng, spatialQueryVector, noOverlap)
 			} else {
-				c.splitDFS(rightListSet, query, lengthLim, D, K, odd^1, combination, que, totMinLat, totMaxLat, midLng, totMaxLng, spatialQueryVector)
+				c.splitDFS(rightListSet, query, lengthLim, D, K, odd^1, combination, que, totMinLat, totMaxLat, midLng, totMaxLng, spatialQueryVector, noOverlap)
 			}
 		}
 	}
 }
 
 func (c *cseq) dfs(gridList []map[int][]*pNode, num int, query []int, combination *[]int, que *priorityQueue,
-	totMinLat, totMaxLat, totMinLng, totMaxLng float64, regionMaxVal []float64, K int, spatialQueryVector []float64) {
+	totMinLat, totMaxLat, totMinLng, totMaxLng float64, regionMaxVal []float64, K int, spatialQueryVector []float64, noOverlap bool) {
 	if num == len(query) {
 		pq := make(itemPriorityQueue, 0)
 		var sum float64
@@ -336,7 +336,7 @@ func (c *cseq) dfs(gridList []map[int][]*pNode, num int, query []int, combinatio
 					break
 				}
 			}
-			if !allMatch {
+			if !allMatch || (noOverlap && overlaps(candiVector, c.query)) {
 				return
 			}
 
@@ -413,7 +413,7 @@ func (c *cseq) dfs(gridList []map[int][]*pNode, num int, query []int, combinatio
 			}
 		}
 
-		c.dfs(gridList, num+1, query, combination, que, totMinLat, totMaxLat, totMinLng, totMaxLng, regionMaxVal, K, spatialQueryVector)
+		c.dfs(gridList, num+1, query, combination, que, totMinLat, totMaxLat, totMinLng, totMaxLng, regionMaxVal, K, spatialQueryVector, noOverlap)
 	}
 }
 
@@ -581,4 +581,18 @@ func verifyInitData(data []*model.DataPoint) error {
 	}
 
 	return nil
+}
+
+func overlaps(a, b []int) bool {
+	s := make(map[int]bool)
+	for _, x := range a {
+		s[x] = true
+	}
+	for _, x := range b {
+		if s[x] {
+			return false
+		}
+	}
+
+	return true
 }
